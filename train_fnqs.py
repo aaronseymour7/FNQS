@@ -171,11 +171,7 @@ class FNQSTrainer:
         )
         self._x0 = dtheta  # warm-start next step's CG with this step's solution
 
-        # jax's cg does not populate `info` usefully, so check solve quality
-        # directly: relative residual ||S_bar @ dtheta - F_bar|| / ||F_bar||.
-        # Large (>> 1e-2) means CG did not actually solve the system in
-        # cg_maxiter iterations - a symptom of a badly-conditioned S_bar
-        # (e.g. n_samples too low relative to n_params).
+
         def _global_norm(tree):
             leaves = jax.tree_util.tree_leaves(tree)
             return jnp.sqrt(sum(jnp.sum(jnp.abs(x) ** 2) for x in leaves))
