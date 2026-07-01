@@ -6,8 +6,17 @@ This implements the paper's Algorithm: at each optimization step,
 average the SR quantities (forces F and quantum geometric tensor S)
 across R sampled couplings gamma, then take one natural-gradient
 step on the SHARED network parameters theta.
+
+QGT handling is matrix-free (QGTJacobianPyTree + CG), which is what
+lets this scale to N=20 (n_params ~ 17k) without needing
+n_samples > n_params for a well-conditioned *dense* solve, and without
+ever forming an n_params x n_params matrix.
 """
 import jax
+jax.config.update("jax_enable_x64", True)  # SR/QGT solves want float64 throughout;
+# also avoids float32/float64 dtype-mismatch inside jax.scipy.sparse.linalg.cg's
+# while_loop, since netket promotes Jacobian/QGT internals to float64 anyway.
+
 import jax.numpy as jnp
 import numpy as np
 import netket as nk
@@ -49,12 +58,16 @@ class FNQSTrainer:
         n_chains=32,
         n_discard_per_chain=16,
         diag_shift=1e-2,
+        cg_tol=1e-6,
+        cg_maxiter=200,
         seed=0,
     ):
         self.N = N
         self.gammas = list(gammas)
         self.R = len(self.gammas)
         self.diag_shift = diag_shift
+        self.cg_tol = cg_tol
+        self.cg_maxiter = cg_maxiter
 
         self.graph = build_chain_graph(N)
         self.hi = nk.hilbert.Spin(s=0.5, N=N, total_sz=0)
@@ -70,7 +83,11 @@ class FNQSTrainer:
             [dummy_sigma, jnp.full((4, 1), self.gammas[0])], axis=-1
         )
         self.params = self.model.init(key, dummy_x)
+        self.params = jax.tree_util.tree_map(
+            lambda x: x.astype(jnp.float64), self.params
+        )
         _, self.unravel = ravel_pytree(self.params)
+        self.n_params = sum(x.size for x in jax.tree_util.tree_leaves(self.params))
 
         # one persistent MCState + Hamiltonian per gamma in the training grid
         self.states = []
@@ -91,40 +108,74 @@ class FNQSTrainer:
             self.states.append(vs)
             self.hamiltonians.append(H)
 
+        # warm-start guess for CG, carried across steps. Built lazily inside
+        # step() from F_bar rather than here, because netket's forces/QGT
+        # pytrees are float64 even when the model params are float32 (jax's
+        # x64 promotion inside expect_and_grad) - jax.scipy.sparse.linalg.cg
+        # requires x0's dtype to exactly match the matvec output's dtype.
+        self._x0 = None
+
     def _sync_params(self):
         for vs in self.states:
             vs.variables = self.params
 
-    def step(self, lr=0.02):
+    def step(self, lr=0.02, diag_shift=None):
+        """One generalized-SR step, averaged over all gamma in self.gammas.
+
+        QGT is never materialized as a dense matrix: each S_r is a
+        QGTJacobianPyTree LinearOperator (matrix-free matvec), the R of
+        them are averaged into a single matvec closure, and the natural
+        gradient direction is obtained with CG directly over the params
+        pytree (no ravel/unravel needed for the solve itself).
+        """
+        if diag_shift is None:
+            diag_shift = self.diag_shift
         self._sync_params()
 
-        F_list, S_list, E_list = [], [], []
+        F_list, S_ops, E_list, Evar_list = [], [], [], []
         for vs, H in zip(self.states, self.hamiltonians):
             vs.sample()
             E, forces = vs.expect_and_grad(H)
-            F_flat, _ = ravel_pytree(forces)
-            S = vs.quantum_geometric_tensor(
-                nk.optimizer.qgt.QGTJacobianDense
-            ).to_dense()
-            F_list.append(jnp.real(F_flat))
-            S_list.append(jnp.real(S))
+            F_list.append(jax.tree_util.tree_map(jnp.real, forces))
+            # diag_shift baked in per-gamma; since it's linear (shift*I),
+            # averaging R copies of (S_r + shift*I) = S_bar + shift*I, exact.
+            S_ops.append(
+                nk.optimizer.qgt.QGTJacobianPyTree(vs, diag_shift=diag_shift)
+            )
             E_list.append(E.mean.real)
+            Evar_list.append(E.variance)
 
-        F_bar = jnp.mean(jnp.stack(F_list), axis=0)
-        S_bar = jnp.mean(jnp.stack(S_list), axis=0)
+        # F_bar: pytree average of the R force pytrees
+        F_bar = jax.tree_util.tree_map(
+            lambda *xs: jnp.mean(jnp.stack(xs), axis=0), *F_list
+        )
 
-        # regularized natural-gradient solve via truncated pseudo-inverse
-        # (more robust than a plain solve when S is estimated from a finite
-        # sample and is close to singular / ill-conditioned)
-        S_reg = S_bar + self.diag_shift * jnp.eye(S_bar.shape[0])
-        dtheta, *_ = jnp.linalg.lstsq(S_reg, F_bar, rcond=1e-6)
+        # matrix-free averaged QGT action: v -> (1/R) sum_r S_r @ v
+        def S_bar_matvec(v):
+            applied = [S @ v for S in S_ops]
+            return jax.tree_util.tree_map(
+                lambda *xs: jnp.mean(jnp.stack(xs), axis=0), *applied
+            )
 
-        theta_flat, _ = ravel_pytree(self.params)
-        theta_flat = theta_flat - lr * dtheta
-        self.params = self.unravel(theta_flat)
+        if self._x0 is None:
+            self._x0 = jax.tree_util.tree_map(jnp.zeros_like, F_bar)
+
+        dtheta, info = jax.scipy.sparse.linalg.cg(
+            S_bar_matvec, F_bar, x0=self._x0,
+            tol=self.cg_tol, maxiter=self.cg_maxiter,
+        )
+        self._x0 = dtheta  # warm-start next step's CG with this step's solution
+
+        new_params_subtree = jax.tree_util.tree_map(
+            lambda p, d: p - lr * d, self.params["params"], dtheta
+        )
+        self.params = {**self.params, "params": new_params_subtree}
         self._sync_params()
 
-        return np.array(E_list)
+        return {
+            "energy": np.array(E_list),
+            "energy_var": np.array(Evar_list),
+        }
 
     def energy_per_gamma(self):
         self._sync_params()
