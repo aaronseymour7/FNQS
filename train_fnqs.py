@@ -182,9 +182,11 @@ class FNQSTrainer:
         rel_residual = float(_global_norm(residual) / (_global_norm(F_bar) + 1e-12))
         dtheta_norm = float(_global_norm(dtheta))
 
-        self.params = jax.tree_util.tree_map(
-            lambda p, d: p - lr * d, self.params, dtheta
-        )
+        self.params = {
+            "params": jax.tree_util.tree_map(
+                lambda p, d: p - lr * d, self.params["params"], dtheta
+            )
+        }
         self._sync_params()
 
         return {
