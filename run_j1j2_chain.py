@@ -67,8 +67,8 @@ if __name__ == "__main__":
         d_ff=64,
         n_layers=2,
         n_samples=8192,    # raised from 4096 - see module docstring
-        n_chains=256,      # raised from 128 for better decorrelation near the transition
-        n_discard_per_chain=64,
+        n_chains=64,      # raised from 128 for better decorrelation near the transition
+        n_discard_per_chain=32,
         diag_shift=0.05,   # start of the decay schedule; see diag_shift_schedule
         cg_maxiter=250,
         seed=0,
