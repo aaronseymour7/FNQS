@@ -83,6 +83,8 @@ if __name__ == "__main__":
     log_every = 20
     ckpt_every = 100
 
+    prev_dtheta_norm = None
+
     t0 = time.time()
     for it in range(n_iters):
         shift = diag_shift_schedule(it, n_iters)
@@ -91,10 +93,33 @@ if __name__ == "__main__":
         if it % log_every == 0:
             elapsed = time.time() - t0
             print(
-                f"[{it:5d}] {elapsed:8.1f}s  diag_shift={shift:.4f}  "
-                f"E(gamma) = {np.round(out['energy'], 3)}  "
-                f"Var(gamma) = {np.round(out['energy_var'], 3)}"
+                f"[{it:5d}] {elapsed:8.1f}s  diag_shift={shift:.4f}\n"
+                f"    E        = {np.round(out['energy'], 3)}\n"
+                f"    Var      = {np.round(out['energy_var'], 3)}\n"
+                f"    err      = {np.round(out['error_of_mean'], 3)}\n"
+                f"    R_hat    = {np.round(out['R_hat'], 3)}\n"
+                f"    tau_corr = {np.round(out['tau_corr'], 2)}\n"
+                f"    accept   = {np.round(out['acceptance'], 3)}\n"
+                f"    cg_resid = {out['cg_rel_residual']:.4f}   "
+                f"|dtheta| = {out['dtheta_norm']:.3f}"
             )
+
+            # red-flag checks - don't fail the run, just make problems visible
+            flags = []
+            if np.any(out['acceptance'] < 0.1):
+                flags.append("LOW ACCEPTANCE (<10%) - chains may be stuck; "
+                              "sampler/gradient estimates unreliable this step")
+            if np.any(out['R_hat'] > 1.1):
+                flags.append("HIGH R_HAT (>1.1) - chains not equilibrated")
+            if out['cg_rel_residual'] > 1e-2:
+                flags.append("CG DID NOT CONVERGE (residual > 1e-2) - "
+                              "raise cg_maxiter or diag_shift")
+            if prev_dtheta_norm is not None and out['dtheta_norm'] > 5 * prev_dtheta_norm:
+                flags.append(f"UPDATE SPIKE - |dtheta| jumped {out['dtheta_norm']/prev_dtheta_norm:.1f}x "
+                              "vs previous logged step")
+            for f in flags:
+                print(f"    !! {f}")
+            prev_dtheta_norm = out['dtheta_norm']
 
         if it % ckpt_every == 0 and it > 0:
             with open(CKPT_PATH, "wb") as f:
