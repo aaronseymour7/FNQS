@@ -133,6 +133,7 @@ class FNQSTrainer:
         self._sync_params()
 
         F_list, S_ops, E_list, Evar_list = [], [], [], []
+        Rhat_list, tau_list, err_list, accept_list = [], [], [], []
         for vs, H in zip(self.states, self.hamiltonians):
             vs.sample()
             E, forces = vs.expect_and_grad(H)
@@ -144,6 +145,10 @@ class FNQSTrainer:
             )
             E_list.append(E.mean.real)
             Evar_list.append(E.variance)
+            Rhat_list.append(float(E.R_hat))
+            tau_list.append(float(E.tau_corr))
+            err_list.append(float(E.error_of_mean))
+            accept_list.append(float(vs.sampler_state.acceptance))
 
         # F_bar: pytree average of the R force pytrees
         F_bar = jax.tree_util.tree_map(
@@ -166,6 +171,21 @@ class FNQSTrainer:
         )
         self._x0 = dtheta  # warm-start next step's CG with this step's solution
 
+        # jax's cg does not populate `info` usefully, so check solve quality
+        # directly: relative residual ||S_bar @ dtheta - F_bar|| / ||F_bar||.
+        # Large (>> 1e-2) means CG did not actually solve the system in
+        # cg_maxiter iterations - a symptom of a badly-conditioned S_bar
+        # (e.g. n_samples too low relative to n_params).
+        def _global_norm(tree):
+            leaves = jax.tree_util.tree_leaves(tree)
+            return jnp.sqrt(sum(jnp.sum(jnp.abs(x) ** 2) for x in leaves))
+
+        residual = jax.tree_util.tree_map(
+            lambda a, b: a - b, S_bar_matvec(dtheta), F_bar
+        )
+        rel_residual = float(_global_norm(residual) / (_global_norm(F_bar) + 1e-12))
+        dtheta_norm = float(_global_norm(dtheta))
+
         new_params_subtree = jax.tree_util.tree_map(
             lambda p, d: p - lr * d, self.params["params"], dtheta
         )
@@ -175,6 +195,12 @@ class FNQSTrainer:
         return {
             "energy": np.array(E_list),
             "energy_var": np.array(Evar_list),
+            "R_hat": np.array(Rhat_list),
+            "tau_corr": np.array(tau_list),
+            "error_of_mean": np.array(err_list),
+            "acceptance": np.array(accept_list),
+            "cg_rel_residual": rel_residual,
+            "dtheta_norm": dtheta_norm,
         }
 
     def energy_per_gamma(self):
