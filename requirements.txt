@@ -1,5 +1,5 @@
-netket>=3.11,<4.0
-jax>=0.4.25
-jaxlib>=0.4.25
-flax>=0.7.4
-numpy>=1.24
+jax==0.10.2
+jaxlib==0.10.2
+netket==3.22.3
+flax==0.12.7
+numpy==2.4.6
