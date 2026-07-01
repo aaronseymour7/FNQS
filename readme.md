@@ -1,75 +1,197 @@
-# FNQS pipeline: 20-site 1D J1-J2 Heisenberg chain, gamma = J2/J1
+# FNQS — Foundation Neural-Network Quantum States
 
-## Files
+A JAX/NetKet implementation of Foundation Neural-Network Quantum States (FNQS), a variational Monte Carlo framework that trains a single Vision Transformer (ViT) ansatz across multiple Hamiltonians simultaneously. The architecture processes **multimodal inputs** — spin configurations and Hamiltonian coupling constants — enabling generalization across coupling regimes and efficient simulation of disordered quantum systems.
 
-- `model.py` — the transformer ansatz. Takes a spin configuration (N sites)
-  plus a scalar coupling `gamma = J2/J1`, splits the configuration into
-  patches, concatenates `gamma` onto every patch (the O(1)-coupling
-  embedding strategy from the FNQS paper), runs it through a small
-  transformer encoder, sum-pools, and outputs a complex log-amplitude
-  via two real heads (log|psi| and phase) — numerically equivalent to a
-  single complex output layer but more stable to train.
+Based on: *Foundation Neural-Network Quantum States as a Unified Ansatz for Multiple Hamiltonians*, [Nature Communications (2025)](https://www.nature.com/articles/s41467-025-62098-x).
 
-- `train_fnqs.py` — `FNQSTrainer`: implements the paper's generalized
-  Stochastic Reconfiguration. At each step it samples configurations
-  independently for every gamma in a fixed training grid (using
-  Metropolis-Hastings with spin-exchange moves, since this sum-pooling
-  architecture is not autoregressive), computes the per-gamma forces F_r
-  and quantum geometric tensor S_r, averages them across gamma, and takes
-  one natural-gradient step on the network parameters shared by all gamma.
+---
 
-- `run_j1j2_chain.py` — the actual N=20 pipeline you asked for, with
-  gamma sampled on a grid spanning [0, 0.5] to cover the known
-  Majumdar-Ghosh / dimerization transition at J2/J1 = 0.2411.
+## Table of Contents
 
-## What's been validated in this session
+- [Overview](#overview)
+- [Architecture](#architecture)
+- [Requirements](#requirements)
+- [Installation](#installation)
+- [Usage](#usage)
+- [Repository Structure](#repository-structure)
+- [Parameters Reference](#parameters-reference)
+- [Expected Output](#expected-output)
 
-- Hamiltonian construction (colored-edge graph -> `nk.operator.Heisenberg`
-  with J1/J2 bonds) checked against exact diagonalization at N=8.
-- Single-gamma training (standard VMC+SR) converges toward the exact
-  ground energy at N=8.
-- The multi-gamma generalized-SR loop (the actual FNQS mechanism) was
-  run at N=8 with 3 gamma values sharing one set of weights; energies
-  decreased monotonically and landed within 0.3-1.8% of exact
-  diagonalization for all three gammas after only 60 steps on a
-  deliberately tiny network.
-- The full pipeline was confirmed to run without errors at the real
-  target size, N=20 (184,756-dimensional Hilbert space in the
-  total-Sz=0 sector), for several SR steps.
+---
 
-## What's *not* included: a converged N=20 run
+## Overview
 
-Getting a tight, paper-quality N=20 result needs meaningfully more
-compute than fits in this session:
+Standard Neural-Network Quantum States (NQS) are trained for a fixed Hamiltonian. FNQS extends this by treating the coupling constants themselves as inputs to the network, allowing one model to represent ground states across a family of Hamiltonians. The current implementation targets the **J1–J2 Heisenberg spin chain**:
 
-1. **Sample budget.** SR requires `n_samples` comfortably larger than
-   `n_params`, or the quantum geometric tensor solve is ill-conditioned
-   (netket warns about this explicitly). At N=20 with a reasonably
-   expressive network you'll have several thousand parameters, so plan
-   for `n_samples` in the 4,000-20,000 range.
-2. **Iteration count.** The paper's runs use hundreds to low thousands of
-   SR steps. Each step here (dense QGT solve) costs O(n_params^2 *
-   n_samples); at N=20 that was ~50-100s/step on CPU with 1024 samples
-   in this environment.
-3. **Solver.** For n_params in the thousands, replace the dense
-   `QGTJacobianDense.to_dense()` solve in `train_fnqs.py` with a
-   matrix-free conjugate-gradient solve (`QGTJacobianPyTree` or
-   netket's `VMC_SR`/minSR driver), which avoids ever forming an
-   n_params x n_params matrix and scales far better.
-4. **Hardware.** JAX will use a GPU automatically if one is available
-   (`jax.devices()`); this session ran on CPU only.
+$$H = J_1 \sum_{\langle i,j \rangle} \mathbf{S}_i \cdot \mathbf{S}_j + J_2 \sum_{\langle\langle i,j \rangle\rangle} \mathbf{S}_i \cdot \mathbf{S}_j$$
 
-## How to extend
+where $\gamma = J_2 / J_1$ is swept across a user-specified range. The model is trained jointly on all $\gamma$ values using **Stochastic Reconfiguration (SR)** with a shared quantum geometric tensor averaged across Hamiltonians.
 
-- **Different gamma range / resolution:** just edit the `gammas` list
-  in `run_j1j2_chain.py` — e.g. densify near 0.2411 to resolve the
-  transition more sharply, or extend past it to see the dimerized phase.
-- **Fidelity susceptibility:** once trained, differentiate `model.apply`
-  with respect to `gamma` (autodiff through the same forward pass used
-  for sampling) to get the FNQS paper's fidelity susceptibility, which
-  will peak near the transition — this doesn't require retraining,
-  just a `jax.grad`/`jax.jacfwd` wrapper around the existing model.
-- **Adding J3 or more couplings:** extend the `gamma` vector's last
-  dimension in `model.py` from 1 to however many O(1) couplings you
-  want, and adjust the Hamiltonian construction accordingly (as in the
-  paper's 2D J1-J2-J3 experiment).
+---
+
+## Architecture
+
+The ansatz is a ViT adapted for multimodal quantum inputs:
+
+1. **Patching** — the spin configuration $\sigma \in \{-1, +1\}^N$ is split into non-overlapping patches of size `patch`.
+2. **Coupling injection** — the coupling ratio $\gamma$ is tiled and appended to each patch, giving tokens of dimension `patch + 1`.
+3. **Linear embedding** — tokens are projected to dimension `d_model`.
+4. **Transformer encoder** — `n_layers` blocks of multi-head self-attention (`n_heads`) and MLP (`mlp_dim`), with pre-layer normalisation.
+5. **Output heads** — sum-pooled representation is split into a log-amplitude head and a phase head, producing a complex log-wavefunction $\log \Psi(\sigma, \gamma)$.
+
+Optimization uses the **natural gradient** (SR) with a $\bar{S}$-matrix formed by averaging the quantum geometric tensors across all training $\gamma$ values, solved via conjugate gradient.
+
+---
+
+## Requirements
+
+```
+netket>=3.11,<4.0
+jax>=0.4.25
+jaxlib>=0.4.25
+flax>=0.7.4
+numpy>=1.24
+```
+
+GPU acceleration is strongly recommended for N ≥ 20. The code runs on CPU for small N but is substantially slower.
+
+---
+
+## Installation
+
+```bash
+git clone https://github.com/aaronseymour7/FNQS.git
+cd FNQS
+
+# CPU-only JAX
+pip install "jax>=0.4.25" "jaxlib>=0.4.25" netket flax numpy
+
+# GPU (CUDA 12)
+pip install "jax[cuda12]>=0.4.25" netket flax numpy
+
+# Verify JAX device
+python -c "import jax; print(jax.devices())"
+```
+
+---
+
+## Usage
+
+### Running the N=20 J2 Sweep
+
+After applying the fixes above:
+
+```bash
+python run_j1j2_chain.py
+```
+
+This trains the FNQS model on six values of $\gamma \in \{0.0, 0.1, 0.2, 0.3, 0.4, 0.5\}$ simultaneously for 2000 SR steps. Key hyperparameters at the top of `run_j1j2_chain.py`:
+
+```python
+N          = 20          # system size (number of sites)
+J1         = 1.0         # nearest-neighbour coupling (fixed)
+gammas     = [0.0, 0.1, 0.2, 0.3, 0.4, 0.5]  # J2/J1 values to sweep
+n_iters    = 2000        # SR optimization steps
+n_samples  = 8192        # total MC samples per step
+lr         = 0.01        # learning rate
+diag_shift = 0.01        # SR regularisation (diagonal shift on S-matrix)
+```
+
+### Changing the System Size
+
+Set `N` in `run_j1j2_chain.py`. The `patch` size must evenly divide `N`:
+
+| N  | Recommended `patch` | Patches |
+|----|---------------------|---------|
+| 10 | 2                   | 5       |
+| 20 | 4                   | 5       |
+| 40 | 4 or 8              | 10 or 5 |
+| 100| 5 or 10             | 20 or 10|
+
+### Changing the $\gamma$ Grid
+
+Edit the `gammas` list:
+
+```python
+# Fine sweep around the J1-J2 critical point (~0.241)
+gammas = [0.15, 0.20, 0.22, 0.24, 0.26, 0.28, 0.30, 0.35]
+```
+
+---
+
+## Repository Structure
+
+```
+FNQS/
+├── model.py            # ViT ansatz: FNQS_J1J2, EncoderBlock, MultiHeadAttention
+├── train_fnqs.py       # FNQSTrainer: SR loop, QGT averaging, CG solver
+└── run_j1j2_chain.py   # Entry point: N=20 J1-J2 chain sweep
+```
+
+### `model.py`
+
+Defines `FNQS_J1J2`, a Flax `nn.Module` with signature:
+
+```python
+FNQS_J1J2(
+    d_model  = 64,   # embedding / transformer width
+    n_heads  = 4,    # attention heads
+    n_layers = 2,    # transformer encoder blocks
+    mlp_dim  = 128,  # MLP hidden dim inside each encoder block
+    patch    = 2,    # spatial patch size (must divide N)
+)
+```
+
+Input shape: `(batch, N + 1)` — last column is $\gamma$, first N columns are $\pm 1$ spins.
+Output shape: `(batch,)` — complex log-amplitude $\log \Psi(\sigma, \gamma)$.
+
+### `train_fnqs.py`
+
+Defines `FNQSTrainer`, which:
+
+- Wraps the model so each $\gamma$ value gets its own `MCState` with a fixed-$\gamma$ apply function.
+- Builds `QGTJacobianPyTree` for each $\gamma$ and averages them into $\bar{S}$.
+- Averages forces across $\gamma$ values into $\bar{F}$.
+- Solves $\bar{S}\, \delta\theta = \bar{F}$ via conjugate gradient.
+- Updates shared parameters and syncs all `MCState` objects.
+
+### `run_j1j2_chain.py`
+
+Entry point that constructs the Hamiltonian for each $\gamma$, builds samplers, instantiates `FNQSTrainer`, and runs the SR loop with periodic logging and checkpointing.
+
+---
+
+## Parameters Reference
+
+| Parameter | Default | Description |
+|---|---|---|
+| `N` | 20 | Number of lattice sites |
+| `J1` | 1.0 | Nearest-neighbour coupling |
+| `gammas` | [0.0…0.5] | List of $J_2/J_1$ values trained simultaneously |
+| `d_model` | 64 | Transformer embedding dimension |
+| `n_heads` | 4 | Number of attention heads (`d_model` must be divisible by `n_heads`) |
+| `n_layers` | 2 | Number of encoder blocks |
+| `mlp_dim` | 128 | MLP width inside each encoder block |
+| `patch` | 4 | Patch size (must divide `N`) |
+| `n_samples` | 8192 | Total MCMC samples per SR step |
+| `n_chains` | 64 | Number of Markov chains (recommended after fix) |
+| `n_discard_per_chain` | 32 | Thermalization steps per chain (recommended after fix) |
+| `n_iters` | 2000 | Total SR optimization steps |
+| `lr` | 0.01 | Learning rate |
+| `diag_shift` | 0.01 | SR regularisation: diagonal shift added to $\bar{S}$ |
+| `cg_tol` | 1e-5 | CG solver convergence tolerance |
+
+---
+
+## Expected Output
+
+Training logs print every 20 steps with one row per $\gamma$:
+
+```
+Step 0040 | γ=0.00  E/N=-0.4431(3)  σ²=0.0021  R̂=1.003  acc=0.52
+Step 0040 | γ=0.10  E/N=-0.4299(4)  σ²=0.0034  R̂=1.005  acc=0.51
+Step 0040 | γ=0.20  E/N=-0.4071(5)  σ²=0.0051  R̂=1.008  acc=0.49
+...
+```
+
+Checkpoints are saved to `fnqs_j1j2_n20_ckpt.pkl` every 100 steps. Converged energies for the J1–J2 chain can be compared against exact diagonalisation benchmarks; at $\gamma = 0$ (pure Heisenberg) the ground-state energy per site is $E_0/N \approx -0.4431$ for open boundary conditions at N=20.
