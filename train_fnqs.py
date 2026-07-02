@@ -60,6 +60,7 @@ class FNQSTrainer:
         diag_shift=1e-2,
         cg_tol=1e-6,
         cg_maxiter=200,
+        chunk_size=None,
         seed=0,
     ):
         self.N = N
@@ -104,6 +105,7 @@ class FNQSTrainer:
                 n_discard_per_chain=n_discard_per_chain,
                 variables=self.params,
                 seed=seed + i + 1,
+                chunk_size=chunk_size,
             )
             self.states.append(vs)
             self.hamiltonians.append(H)
