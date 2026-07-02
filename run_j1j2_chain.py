@@ -71,7 +71,7 @@ if __name__ == "__main__":
         n_discard_per_chain=32,
         diag_shift=0.05,   # start of the decay schedule; see diag_shift_schedule
         cg_maxiter=400,
-        chunk_size=4096,
+        chunk_size=512,
         seed=0,
     )
 
