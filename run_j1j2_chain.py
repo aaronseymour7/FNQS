@@ -43,7 +43,7 @@ from train_fnqs import FNQSTrainer
 CKPT_PATH = "fnqs_j1j2_n20_ckpt.pkl"
 
 
-def diag_shift_schedule(it, n_iters, start=0.05, end=0.005):
+def diag_shift_schedule(it, n_iters, start=0.05, end=0.02):
     """Exponential decay from `start` to `end` over the run."""
     frac = it / max(n_iters - 1, 1)
     return start * (end / start) ** frac
@@ -62,15 +62,15 @@ if __name__ == "__main__":
         N=N,
         gammas=gammas,
         patch=4,           # 5 patches of 4 sites each
-        d_model=32,
-        n_heads=4,
-        d_ff=64,
-        n_layers=2,
-        n_samples=8192,    # raised from 4096 - see module docstring
+        d_model=64,
+        n_heads=8,
+        d_ff=256,
+        n_layers=3,
+        n_samples=16384,    # raised from 4096 - see module docstring
         n_chains=64,      # raised from 128 for better decorrelation near the transition
         n_discard_per_chain=32,
         diag_shift=0.05,   # start of the decay schedule; see diag_shift_schedule
-        cg_maxiter=250,
+        cg_maxiter=400,
         seed=0,
     )
 
@@ -78,7 +78,7 @@ if __name__ == "__main__":
           f"n_params/n_samples={trainer.n_params/8192:.2f}, R={len(gammas)} gammas")
     print(f"gammas = {gammas}")
 
-    n_iters = 2000       # paper-scale run; increase/decrease as compute allows
+    n_iters = 3000       # paper-scale run; increase/decrease as compute allows
     lr = 0.02
     log_every = 20
     ckpt_every = 100
