@@ -143,7 +143,7 @@ class FNQSTrainer:
             # diag_shift baked in per-gamma; since it's linear (shift*I),
             # averaging R copies of (S_r + shift*I) = S_bar + shift*I, exact.
             S_ops.append(
-                nk.optimizer.qgt.QGTJacobianPyTree(vs, diag_shift=diag_shift)
+                nk.optimizer.qgt.QGTJacobianPyTree(vs, diag_shift=diag_shift, chunk_size=vs.chunk_size)
             )
             E_list.append(E.mean.real)
             Evar_list.append(E.variance)
