@@ -161,7 +161,7 @@ class FNQS1D(nn.Module):
 # --------------------------------------------------------------------------
 R = 9                        # number of couplings sampled per SR step ("systems")
 M_PER_SYSTEM = 512           # MC samples per system  ->  total M = R * M_PER_SYSTEM
-N_ITERS = 1200
+N_ITERS = 1000
 LR = 0.02
 J2_LOW, J2_HIGH = 0.0, 0.6   # support of P(j2) the model is trained to cover
 
@@ -191,11 +191,19 @@ def sample_j2_batch(size):
 
 # -- diag-shift annealing schedule --
 # Starts high (strong regularization while the ensemble-averaged S is still
-# poorly conditioned / far from any good basin) and decays toward the old
-# fixed value. Tune DIAG_SHIFT_START/END/DECAY_ITERS if you still see
-# blowups or if it feels over-regularized (energy plateauing too early).
+# poorly conditioned / far from any good basin) and decays toward a floor.
+#
+# NOTE: the original floor of 1e-3 (matching the very first fixed-shift
+# script) turned out to be insufficient over long training -- raw SR update
+# norms intermittently spiked into the thousands/tens-of-thousands even
+# after annealing completed (e.g. |delta|=77915 at iter 370, =140219 at
+# iter 790 in one 1200-iter run), meaning S_reg was essentially singular at
+# those steps, not just producing a large-but-legitimate step. Raised the
+# floor so the ensemble-averaged QGT stays better-conditioned for the whole
+# run. If convergence now feels too damped/slow, lower DIAG_SHIFT_END
+# gradually (e.g. try 2e-3) rather than jumping back to 1e-3.
 DIAG_SHIFT_START = 1e-2
-DIAG_SHIFT_END = 1e-3
+DIAG_SHIFT_END = 3e-3
 DIAG_SHIFT_DECAY_ITERS = 400   # exponential decay reaches ~DIAG_SHIFT_END by this iter
 
 
@@ -206,24 +214,32 @@ def diag_shift_at(it):
     return float(np.exp(log_shift))
 
 
-# -- SR update clipping --
-# Guards against a single ill-conditioned S_reg solve corrupting params for
-# the rest of training (this is what produced the isolated +0.39 / +1.22
-# energy spikes at iters 250/330 in the original unclipped R=9 run).
-#
-# NOTE: 5.0 was an untuned guess and turned out to throttle almost every
-# early-training step (raw |delta| routinely 20-80 for iters 0-500), which
-# stalled convergence rather than just preventing blowups. Set this high
-# enough that it only fires on genuine outliers, not routine large-but-
-# legitimate SR steps. If you still see occasional isolated positive-energy
-# iterations with this value, lower it; if [CLIPPED] fires on most
-# iterations again, raise it further.
+# -- SR update clipping / rejection --
+# Two-tier defense against a bad S_reg solve:
+#   1. REJECT_UPDATE_NORM: if the *raw* (pre-clip) delta norm exceeds this,
+#      S_reg was essentially singular at this step and the direction itself
+#      is garbage, not just "large but legitimate". In that case we SKIP the
+#      update entirely this iteration (params unchanged) rather than
+#      rescaling a garbage direction and applying it anyway -- rescaling
+#      doesn't fix a bad direction, and applying it is what corrupted
+#      training in the iter-370/iter-790 blowups above.
+#   2. MAX_UPDATE_NORM: for deltas below the reject threshold but still
+#      larger than typical, clip (rescale) as before -- this handles
+#      legitimately large-but-usable SR steps, mostly early in training.
 MAX_UPDATE_NORM = 100.0
+REJECT_UPDATE_NORM = 1000.0
 
 model = FNQS1D()
 rng = jax.random.PRNGKey(0)
 dummy_spins = hi.random_state(jax.random.PRNGKey(1), 2)
 variables = model.init(rng, dummy_spins)
+
+# Fix the numpy RNG used for j2 sampling so runs are reproducible/comparable.
+# Without this, every run (even with identical code/config) is a genuinely
+# different stochastic trajectory, which made it impossible to tell whether
+# a change actually helped or just got a luckier draw. Change the seed if
+# you want a different-but-still-reproducible trajectory.
+np.random.seed(0)
 
 sampler = nk.sampler.MetropolisExchange(hi, graph=graph, n_chains=M_PER_SYSTEM)
 
@@ -298,24 +314,34 @@ if __name__ == "__main__":
         S_reg = S + diag_shift_it * np.eye(S.shape[0])
 
         delta_flat = jnp.linalg.solve(S_reg, G)     # SR direction (Eq. 18, up to -eta)
-
-        # -- clip the SR update norm before applying it --
         delta_norm = float(jnp.linalg.norm(delta_flat))
-        if delta_norm > MAX_UPDATE_NORM:
-            delta_flat = delta_flat * (MAX_UPDATE_NORM / delta_norm)
 
-        delta = {"params": unravel(delta_flat)}
+        if delta_norm > REJECT_UPDATE_NORM:
+            # S_reg was essentially singular this step -- the direction is
+            # garbage, not just large. Skip the update entirely rather than
+            # rescaling and applying a corrupting step.
+            rejected = True
+        else:
+            rejected = False
+            if delta_norm > MAX_UPDATE_NORM:
+                delta_flat = delta_flat * (MAX_UPDATE_NORM / delta_norm)
 
-        updates, opt_state = optimizer.update(delta["params"], opt_state, variables["params"])
-        new_params = optax.apply_updates(variables["params"], updates)
-        variables = {**variables, "params": new_params}
+            delta = {"params": unravel(delta_flat)}
+            updates, opt_state = optimizer.update(delta["params"], opt_state, variables["params"])
+            new_params = optax.apply_updates(variables["params"], updates)
+            variables = {**variables, "params": new_params}
 
         if it % 10 == 0:
             tercile_str = bin_by_tercile(j2_batch, energies, J2_LOW, J2_HIGH)
-            clip_flag = " [CLIPPED]" if delta_norm > MAX_UPDATE_NORM else ""
+            if rejected:
+                status = " [REJECTED - update skipped]"
+            elif delta_norm > MAX_UPDATE_NORM:
+                status = " [CLIPPED]"
+            else:
+                status = ""
             print(f"iter {it:4d}  diag_shift={diag_shift_it:.2e}  "
                   f"mean e/site={np.mean(energies):+.5f}  "
-                  f"|delta|={delta_norm:.2f}{clip_flag}\n"
+                  f"|delta|={delta_norm:.2f}{status}\n"
                   f"          {tercile_str}")
 
     with open("fnqs_variables.pkl", "wb") as f:
