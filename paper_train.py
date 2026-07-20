@@ -56,7 +56,15 @@ def make_hamiltonian(j2, j1=J1):
     """Nearest + next-nearest neighbour Heisenberg chain for a given J2."""
     return nk.operator.Heisenberg(hilbert=hi, graph=graph, J=[j1, j2])
 
-
+def make_matvec(vs):
+    """v -> S_k @ v, matrix-free (no n_params^2 matrix ever formed)."""
+    Sk_op = nk.optimizer.qgt.QGTJacobianPyTree(vs, diag_shift=0.0)
+    def mv(v_flat, unravel):
+        v_tree = unravel(v_flat)
+        out_tree = Sk_op @ v_tree
+        out_flat, _ = jax.flatten_util.ravel_pytree(out_tree)
+        return out_flat
+    return mv
 # --------------------------------------------------------------------------
 # 2. FNQS ansatz: a translation-invariant, PATCH-based self-attention network
 #    conditioned on the coupling j2, following the paper's actual
@@ -317,34 +325,35 @@ if __name__ == "__main__":
         j2_batch = sample_j2_batch(R)
         diag_shift_it = diag_shift_at(it)
 
+        matvec_fns = []
         G_sum = None
-        S_sum = None
         energies = []
         unravel = None
-
+        
         for k in range(R):
             j2_k = float(j2_batch[k])
-            # condition system k on its own coupling; params stay shared
-            vstates[k].variables = {
-                **variables,
-                "coupling": {"j2": jnp.asarray(j2_k, jnp.float64)},
-            }
-
+            vstates[k].variables = {**variables, "coupling": {"j2": jnp.asarray(j2_k, jnp.float64)}}
             H_k = make_hamiltonian(j2_k)
-
+        
             e_k, G_k = vstates[k].expect_and_grad(H_k)
-            S_k = qgt_dense(vstates[k])
-
             G_k_flat, unravel = jax.flatten_util.ravel_pytree(G_k)
             G_sum = G_k_flat if G_sum is None else G_sum + G_k_flat
-            S_sum = S_k if S_sum is None else S_sum + S_k
             energies.append(e_k.mean.real / L)
-
-        G = G_sum / R                      # ensemble-averaged gradient, Eq. (16)
-        S = S_sum / R                      # ensemble-averaged QGT,      Eq. (17)
-        S_reg = S + diag_shift_it * np.eye(S.shape[0])
-
-        delta_flat = jnp.linalg.solve(S_reg, G)     # SR direction (Eq. 18, up to -eta)
+        
+            Sk_op = nk.optimizer.qgt.QGTJacobianPyTree(vstates[k], diag_shift=0.0)
+            matvec_fns.append(Sk_op)  # keep the operator itself, not a dense array
+        
+        G = G_sum / R
+        
+        def S_ensemble_mv(v_flat):
+            v_tree = unravel(v_flat)
+            acc = None
+            for Sk_op in matvec_fns:
+                out_flat, _ = jax.flatten_util.ravel_pytree(Sk_op @ v_tree)
+                acc = out_flat if acc is None else acc + out_flat
+            return acc / R + diag_shift_it * v_flat
+        
+        delta_flat, _ = jax.scipy.sparse.linalg.cg(S_ensemble_mv, G, maxiter=200, tol=1e-6)
         delta_norm = float(jnp.linalg.norm(delta_flat))
 
         if delta_norm > REJECT_UPDATE_NORM:
