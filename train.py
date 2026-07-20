@@ -122,7 +122,7 @@ class FNQS1D(nn.Module):
     of a plain positional argument) so that it can be swapped between MC
     samplings without any change to the static structure of the module
     (avoids jit recompilation every time we move to a different system)."""
-    d_model: int = 16
+    d_model: int = 24
     heads: int = 4
     num_layers: int = 2
     L: int = L
@@ -161,7 +161,7 @@ class FNQS1D(nn.Module):
 # --------------------------------------------------------------------------
 R = 9                        # number of couplings sampled per SR step ("systems")
 M_PER_SYSTEM = 512           # MC samples per system  ->  total M = R * M_PER_SYSTEM
-N_ITERS = 1000
+N_ITERS = 100
 LR = 0.02
 J2_LOW, J2_HIGH = 0.0, 0.6   # support of P(j2) the model is trained to cover
 
