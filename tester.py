@@ -99,13 +99,25 @@ def build_test_grid(j2_low, j2_high, n_interp=9, n_extrap_each_side=2, margin=0.
 
 def run_comparison(j2_grid, variables, n_samples=4096, n_discard=16, verbose=True):
     rows = []
+    sampler_eval = nk.sampler.MetropolisExchange(hi, graph=graph, n_chains=n_samples)
+    vs = nk.vqs.MCState(
+        sampler_eval, model,
+        variables={**variables, "coupling": {"j2": jnp.asarray(j2_grid[0], jnp.float64)}},
+        n_samples=n_samples,
+        n_discard_per_chain=1000,   # long cold-start burn-in, once
+    )
+
     for j2 in j2_grid:
         e_exact = exact_energy_per_site(j2)
-        e_nqs, e_err, rel_var = evaluate_nqs_at_j2(
-            j2, variables, n_samples=n_samples, n_discard=n_discard
-        )
-        abs_err = abs(e_nqs - e_exact)
-        rel_err = abs_err / abs(e_exact)
+
+        # warm-start: reuse the *previous* j2's chain state, just swap coupling
+        vs.variables = {**variables, "coupling": {"j2": jnp.asarray(j2, jnp.float64)}}
+        vs.sample(n_discard_per_chain=200)   # short re-equilibration between nearby j2's
+
+        stats = vs.expect(make_hamiltonian(j2))
+        e_nqs = float(stats.mean.real) / L
+        e_err = float(stats.error_of_mean) / L
+        rel_var = float(stats.variance) / (L * abs(e_nqs) + 1e-12) ** 2
         in_support = J2_LOW <= j2 <= J2_HIGH
 
         rows.append(
