@@ -118,6 +118,9 @@ def run_comparison(j2_grid, variables, n_samples=4096, n_discard=16, verbose=Tru
         e_nqs = float(stats.mean.real) / L
         e_err = float(stats.error_of_mean) / L
         rel_var = float(stats.variance) / (L * abs(e_nqs) + 1e-12) ** 2
+
+        abs_err = abs(e_nqs - e_exact)
+        rel_err = abs_err / abs(e_exact)
         in_support = J2_LOW <= j2 <= J2_HIGH
 
         rows.append(
